@@ -1,0 +1,31 @@
+clip @ git+https://github.com/openai/CLIP.git
+imageio
+cython
+imageio-ffmpeg
+kornia
+numpy
+nvdiffrast @ git+https://github.com/NVlabs/nvdiffrast.git
+Pillow
+PyGLM
+resize-right
+scipy
+smplx
+tqdm
+Ninja
+pyyaml
+matplotlib
+trimesh
+tensorboard
+easydict
+cholespy
+fire
+torch-scatter
+torch-sparse
+-f https://data.pyg.org/whl/torch-1.13.1+11.7.html
+pymeshlab
+open3d
+diffusers
+pyrallis
+loguru
+transformers
+setuptools

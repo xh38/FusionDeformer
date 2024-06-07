@@ -1,0 +1,9 @@
+outputs/
+output/
+output-origin/
+__pycache__/
+.idea/
+output-multi/
+output-multi-deer/
+output-multi-wolf/
+

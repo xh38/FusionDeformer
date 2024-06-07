@@ -1,0 +1,85 @@
+output_path: ./outputs/demo/final-test/bird-dragon
+gpu: 0
+seed: 99
+sds: True
+mvd: False
+guidance_scale: 100
+texture: False
+view_prompt: False
+
+oro_view: True
+multi_image: True
+use_view_consistency: False
+load_mesh_from_file: True
+train_tex: False
+
+
+anneal: False
+diffusion_key: stabilityai/stable-diffusion-2-1-base
+# CLIP-related
+clip_model: ViT-B/32
+consistency_clip_model: ViT-B/32
+consistency_vit_stride: 8
+consistency_vit_layer: 11
+
+#text_prompt: a giraffe
+#base_text_prompt: a cow
+text_prompt: a dragon
+base_text_prompt: a fish
+# Mesh
+mesh: ./meshes/bird.obj
+retriangulate: 0
+
+# Render settings
+bsdf: diffuse
+
+# Hyper-parameters
+lr: 0.0025
+epochs: 5000
+
+part_jacobian: False
+
+part_deform: False
+part_file: ./meshes/part/spot-head.txt
+use_jacobian: True
+regularize_jacobians_weight: 0.5
+
+use_normal_sim: True
+regularize_normal_weight: 0.1 # 0.1
+
+use_laplacian: True
+regularize_laplacian_weight: 40.0 # 40.0
+
+consistency_loss_weight: 0.5
+consistency_elev_filter: 30
+consistency_azim_filter: 20
+diffusion_weight: 1.0
+batch_size: 1 # 25 originally, 1 for diffusion
+train_res: 512
+resize_method: cubic
+
+# Camera parameters
+fov_min: 30.0
+fov_max: 45.0
+dist_min: 3
+dist_max: 3
+light_power: 5.0
+elev_alpha: 1.0
+elev_beta: 5.0 
+elev_max: 30.0
+azim_min: 0.0
+azim_max: 360.0
+aug_loc: 0
+aug_light: 1
+aug_bkg: 1
+adapt_dist: 1
+
+# log parameters
+log_interval: 20
+log_interval_im: 500
+log_interval_mesh: 500
+log_elev: 30.0
+log_fov: 60.0
+log_dist: 3.0
+log_res: 512
+log_light_power: 3.0

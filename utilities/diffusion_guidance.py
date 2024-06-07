@@ -1,0 +1,346 @@
+import time
+
+import torch
+import torch.nn as nn
+from diffusers import StableDiffusionPipeline, DDIMScheduler, DiffusionPipeline, DDPMScheduler, PNDMScheduler
+from pathlib import Path
+import torch.nn.functional as F
+from torch.cuda.amp import custom_bwd, custom_fwd
+from torchvision.utils import save_image
+
+import numpy as np
+
+class SpecifyGradient(torch.autograd.Function):
+    @staticmethod
+    @custom_fwd
+    def forward(ctx, input_tensor, gt_grad):
+        ctx.save_for_backward(gt_grad)
+        # we return a dummy value 1, which will be scaled by amp's scaler so we get the scale in backward.
+        return torch.ones([1], device=input_tensor.device, dtype=input_tensor.dtype)
+
+    @staticmethod
+    @custom_bwd
+    def backward(ctx, grad_scale):
+        gt_grad, = ctx.saved_tensors
+        gt_grad = gt_grad * grad_scale
+        return gt_grad, None
+
+class StableDiffusion(nn.Module):
+    def __init__(self, device, fp16=False, hf_key=None, sd_version='2.1', t_range=[0.02, 0.98]):
+        super().__init__()
+
+        self.device = device
+
+        print(f'[INFO] loading stable diffusion...')
+        self.sd_version = sd_version
+        if hf_key is not None:
+            print(f'[INFO] using hugging face custom model key: {hf_key}')
+            model_key = hf_key
+        elif self.sd_version == '2.1':
+            model_key = "F:/models/stable-diffusion-2-1-base"
+        elif self.sd_version == 'IF':
+            model_key = "C:/Users/AAA/Downloads/IF"
+        elif self.sd_version == '1.5':
+            model_key = "runwayml/stable-diffusion-v1-5"
+        else:
+            raise ValueError(f'Stable-diffusion version {self.sd_version} not supported.')
+        # model_key = 'CompVis/stable-diffusion-v1-4'
+        self.precision_t = torch.float16 if fp16 else torch.float32
+        self.num_train_timesteps = 1000
+        self.min_step = int(self.num_train_timesteps * 0.02)
+        self.max_step = int(self.num_train_timesteps * 0.98)
+
+        # self.vae = AutoencoderKL.from_pretrained(model_key, subfolder="vae").to(self.device)
+        # # 2. Load the tokenizer and text encoder to tokenize and encode the text.
+        # self.tokenizer = CLIPTokenizer.from_pretrained("openai/clip-vit-large-patch14")
+        # self.text_encoder = CLIPTextModel.from_pretrained("openai/clip-vit-large-patch14").to(self.device)
+        # self.image_encoder = None
+        # self.image_processor = None
+        #
+        # # 3. The UNet model for generating the latents.
+        # self.unet = UNet2DConditionModel.from_pretrained(model_key, subfolder="unet").to(self.device)
+        #
+        # # 4. Create a scheduler for inference
+        # self.scheduler = PNDMScheduler(beta_start=0.00085, beta_end=0.012, beta_schedule="scaled_linear",
+        #                                num_train_timesteps=self.num_train_timesteps)
+        # pipe = StableDiffusionPipeline.from_pretrained(model_key, torch_dtype=self.precision_t, force_download=True, resume_download=False)
+        pipe = StableDiffusionPipeline.from_pretrained(model_key, torch_dtype=self.precision_t, variant='fp16')
+        # pipe = StableDiffusionPipeline.from_pretrained(model_key, torch_dtype=self.precision_t)
+        oom = False
+        if not oom:
+            pipe = pipe.to(self.device)
+
+        self.vae = pipe.vae
+        self.tokenizer = pipe.tokenizer
+        self.text_encoder = pipe.text_encoder
+        self.unet = pipe.unet
+        self.scheduler = DDIMScheduler.from_pretrained(model_key, subfolder="scheduler", torch_dtype=self.precision_t)
+        del pipe
+
+        # self.num_train_timesteps = self.scheduler.config.num_train_timesteps
+        # self.min_step = int(self.num_train_timesteps * t_range[0])
+        # self.max_step = int(self.num_train_timesteps * t_range[1])
+        self.alphas = self.scheduler.alphas_cumprod.to(self.device)  # for convenience
+        self.scheduler.alphas_cumprod = self.scheduler.alphas_cumprod.to(self.device)
+
+    @torch.no_grad()
+    def get_text_embeds(self, prompt):
+        # prompt: [str]
+
+        inputs = self.tokenizer(prompt, padding='max_length', max_length=self.tokenizer.model_max_length,
+                                return_tensors='pt')
+        embeddings = self.text_encoder(inputs.input_ids.to(self.device))[0]
+
+        return embeddings
+
+    def train_step(self, text_embeddings, pred_rgb, it, guidance_scale=100, as_latent=False, grad_scale=1,
+                   save_guidance_path: Path = None, anneal=False, grad_clamp=False):
+
+        if as_latent:
+            latents = F.interpolate(pred_rgb, (64, 64), mode='bilinear', align_corners=False) * 2 - 1
+        else:
+            # interp to 512x512 to be fed into vae.
+            # start_time = time.time()
+            pred_rgb_512 = F.interpolate(pred_rgb, (512, 512), mode='bilinear', align_corners=False)
+            if self.precision_t == torch.float16:
+                pred_rgb_512 = pred_rgb_512.half()
+            # encode image into latents with vae, requires grad!
+            latents = self.encode_imgs(pred_rgb_512)
+            # end_time = time.time()
+            # print(f"produce latents takes: {end_time - start_time}")
+
+        # timestep ~ U(0.02, 0.98) to avoid very high/low noise level
+        if anneal:
+            # t = self.max_step - (self.max_step - self.min_step) * np.sqrt(it / 20000.0)
+            # t = torch.tensor([t] * latents.shape[0], dtype=torch.long, device=self.device)
+            t = torch.tensor([500] * latents.shape[0], dtype=torch.long, device=self.device)
+        else:
+            t = torch.randint(self.min_step, self.max_step + 1, (latents.shape[0],), dtype=torch.long, device=self.device)
+
+        # predict the noise residual with unet, NO grad!
+        with torch.no_grad():
+            # add noise
+            noise = torch.randn_like(latents)
+            latents_noisy = self.scheduler.add_noise(latents, noise, t)
+            # pred noise
+            latent_model_input = torch.cat([latents_noisy] * 2)
+            tt = torch.cat([t] * 2)
+            # tembs = torch.cat([text_embeddings] * 2)
+            # print(self.unet.config.in_channels)
+            noise_pred = self.unet(latent_model_input, tt, encoder_hidden_states=text_embeddings).sample
+
+        # perform guidance (high scale from paper!)
+        noise_pred_uncond, noise_pred_pos = noise_pred.chunk(2)
+        noise_pred = noise_pred_uncond + guidance_scale * (noise_pred_pos - noise_pred_uncond)
+
+        # import kiui
+        # latents_tmp = torch.randn((1, 4, 64, 64), device=self.device)
+        # latents_tmp = latents_tmp.detach()
+        # kiui.lo(latents_tmp)
+        # self.scheduler.set_timesteps(30)
+        # for i, t in enumerate(self.scheduler.timesteps):
+        #     latent_model_input = torch.cat([latents_tmp] * 3)
+        #     noise_pred = self.unet(latent_model_input, t, encoder_hidden_states=text_embeddings)['sample']
+        #     noise_pred_uncond, noise_pred_pos = noise_pred.chunk(2)
+        #     noise_pred = noise_pred_uncond + 10 * (noise_pred_pos - noise_pred_uncond)
+        #     latents_tmp = self.scheduler.step(noise_pred, t, latents_tmp)['prev_sample']
+        # imgs = self.decode_latents(latents_tmp)
+        # kiui.vis.plot_image(imgs)
+
+        # w(t), sigma_t^2
+        w = (1 - self.alphas[t])
+        # w = self.alphas[t] ** 0.5 * (1 - self.alphas[t])
+
+        grad = grad_scale * w[:, None, None, None] * (noise_pred - noise)
+        grad = torch.nan_to_num(grad)
+        if grad_clamp:
+            grad = grad.clamp(-1, 1)
+
+        if save_guidance_path:
+            with torch.no_grad():
+                if as_latent:
+                    pred_rgb_512 = self.decode_latents(latents)
+
+                # visualize predicted denoised image
+                # The following block of code is equivalent to `predict_start_from_noise`...
+                # see zero123_utils.py's version for a simpler implementation.
+                alphas = self.scheduler.alphas_cumprod.to(latents)
+                total_timesteps = self.max_step - self.min_step + 1
+                index = total_timesteps - t.to(latents.device) - 1
+                b = len(noise_pred)
+                a_t = alphas[index].reshape(b, 1, 1, 1).to(self.device)
+                sqrt_one_minus_alphas = torch.sqrt(1 - alphas)
+                sqrt_one_minus_at = sqrt_one_minus_alphas[index].reshape((b, 1, 1, 1)).to(self.device)
+                pred_x0 = (latents_noisy - sqrt_one_minus_at * noise_pred) / a_t.sqrt()  # current prediction for x_0
+                result_hopefully_less_noisy_image = self.decode_latents(pred_x0.to(latents.type(self.precision_t)))
+                # self.scheduler.set_timesteps(50)
+                # self.scheduler.timesteps_gpu = self.scheduler.timesteps.to(self.device)
+                # bs = 1
+                # large_enough_idxs = self.scheduler.timesteps_gpu.expand([bs, -1]) > t[
+                #                                                                     :bs
+                #                                                                     ].unsqueeze(
+                #     -1
+                # )
+                # idxs = torch.min(large_enough_idxs, dim=1)[1]
+                # t = self.scheduler.timesteps_gpu[idxs]
+                # step_output = self.scheduler.step(noise_pred, t, latents_noisy, eta=1)
+                # visualize noisier image
+                result_noisier_image = self.decode_latents(latents_noisy.to(pred_x0).type(self.precision_t))
+
+                # TODO: also denoise all-the-way
+
+                # all 3 input images are [1, 3, H, W], e.g. [1, 3, 512, 512]
+                viz_images = torch.cat([pred_rgb_512, result_noisier_image, result_hopefully_less_noisy_image], dim=0)
+                # save_image(self.decode_latents(step_output['pred_original_sample']), save_guidance_path.parent / 'x0.png')
+                save_image(viz_images, save_guidance_path)
+
+        # since we omitted an item in grad, we need to use the custom function to specify the gradient
+        # start_time = time.time()
+        # latents.backward(gradient=grad, retain_graph=True)
+        # targets = (latents - grad).detach()
+        # loss = 0.5 * F.mse_loss(latents.float(), targets, reduction='sum') / latents.shape[0]
+        loss = SpecifyGradient.apply(latents, grad)
+        # end_time = time.time()
+        # print(f"specify gradient takes: {end_time - start_time}")
+        return loss
+
+    @torch.no_grad()
+    def produce_latents(self, text_embeddings, height=512, width=512, num_inference_steps=50, guidance_scale=7.5, latents=None):
+
+        if latents is None:
+            latents = torch.randn((text_embeddings.shape[0] // 2, self.unet.in_channels, height // 8, width // 8), device=self.device)
+
+        self.scheduler.set_timesteps(num_inference_steps)
+
+        for i, t in enumerate(self.scheduler.timesteps):
+            # expand the latents if we are doing classifier-free guidance to avoid doing two forward passes.
+            latent_model_input = torch.cat([latents] * 2)
+            # predict the noise residual
+            noise_pred = self.unet(latent_model_input, t, encoder_hidden_states=text_embeddings)['sample']
+
+            # perform guidance
+            noise_pred_uncond, noise_pred_cond = noise_pred.chunk(2)
+            noise_pred = noise_pred_uncond + guidance_scale * (noise_pred_cond - noise_pred_uncond)
+
+            # compute the previous noisy sample x_t -> x_t-1
+            latents = self.scheduler.step(noise_pred, t, latents)['prev_sample']
+
+        return latents
+
+    def decode_latents(self, latents):
+
+        latents = 1 / self.vae.config.scaling_factor * latents
+
+        imgs = self.vae.decode(latents).sample
+        imgs = (imgs / 2 + 0.5).clamp(0, 1)
+
+        return imgs
+
+    def encode_imgs(self, imgs):
+        # imgs: [B, 3, H, W]
+
+        imgs = 2 * imgs - 1
+
+        posterior = self.vae.encode(imgs).latent_dist
+        latents = posterior.sample() * self.vae.config.scaling_factor
+
+        return latents
+    def prompt_to_img(self, prompts, negative_prompts='', height=512, width=512, num_inference_steps=50, guidance_scale=7.5, latents=None):
+
+        if isinstance(prompts, str):
+            prompts = [prompts]
+
+        if isinstance(negative_prompts, str):
+            negative_prompts = [negative_prompts]
+
+        # Prompts -> text embeds
+        pos_embeds = self.get_text_embeds(prompts) # [1, 77, 768]
+        neg_embeds = self.get_text_embeds(negative_prompts)
+        text_embeds = torch.cat([neg_embeds, pos_embeds], dim=0) # [2, 77, 768]
+
+        # Text embeds -> img latents
+        latents = self.produce_latents(text_embeds, height=height, width=width, latents=latents, num_inference_steps=num_inference_steps, guidance_scale=guidance_scale) # [1, 4, 64, 64]
+
+        # Img latents -> imgs
+        imgs = self.decode_latents(latents) # [1, 3, 512, 512]
+
+        # Img to Numpy
+        imgs = imgs.detach().cpu().permute(0, 2, 3, 1).numpy()
+        imgs = (imgs * 255).round().astype('uint8')
+
+        return imgs
+
+class IF_guidance(nn.Module):
+    def __init__(self, device, fp16=False, t_range=[0.02, 0.98]):
+        super().__init__()
+
+        self.device = device
+
+        print(f'[INFO] loading IF...')
+        model_key = "C:/Users/AAA/Downloads/IF"
+
+        # model_key = 'CompVis/stable-diffusion-v1-4'
+        self.precision_t = torch.float16 if fp16 else torch.float32
+        self.num_train_timesteps = 1000
+        self.min_step = int(self.num_train_timesteps * 0.02)
+        self.max_step = int(self.num_train_timesteps * 0.98)
+
+
+        pipe = DiffusionPipeline.from_pretrained(model_key, torch_dtype=self.precision_t, variant='fp16')
+        oom = False
+        if not oom:
+            pipe = pipe.to(self.device)
+
+        # self.vae = pipe.vae
+        self.tokenizer = pipe.tokenizer
+        self.text_encoder = pipe.text_encoder
+        self.unet = pipe.unet
+        self.scheduler = DDPMScheduler.from_pretrained(model_key, subfolder="scheduler", torch_dtype=self.precision_t)
+        del pipe
+
+        # self.num_train_timesteps = self.scheduler.config.num_train_timesteps
+        # self.min_step = int(self.num_train_timesteps * t_range[0])
+        # self.max_step = int(self.num_train_timesteps * t_range[1])
+        self.alphas = self.scheduler.alphas_cumprod.to(self.device)  # for convenience
+
+    def get_text_embeds(self, prompt):
+        # prompt: [str]
+
+        inputs = self.tokenizer(prompt, padding='max_length', max_length=self.tokenizer.model_max_length,
+                                return_tensors='pt')
+        embeddings = self.text_encoder(inputs.input_ids.to(self.device))[0]
+
+        return embeddings
+
+    def train_step(self, text_embeddings, pred_rgb, it, guidance_scale=100, as_latent=False, grad_scale=1,
+                   save_guidance_path: Path = None, anneal=False, grad_clamp=False):
+        batch_size = pred_rgb.shape[0]
+
+        rgb_BCHW = pred_rgb.permute(0, 3, 1, 2)
+        latents = F.interpolate(rgb_BCHW, (64, 64), mode='bilinear', align_corners=False) * 2.0 - 1.0
+        t = torch.randint(self.min_step, self.max_step + 1, (batch_size,), dtype=torch.long, device=self.device)
+        with torch.no_grad():
+            # add noise
+            noise = torch.randn_like(latents)
+            latents_noisy = self.scheduler.add_noise(latents, noise, t)
+            # pred noise
+            latent_model_input = torch.cat([latents_noisy] * 2)
+            tt = torch.cat([t] * 2)
+            # tembs = torch.cat([text_embeddings] * 2)
+            # print(self.unet.config.in_channels)
+            noise_pred = self.unet(latent_model_input, tt, encoder_hidden_states=text_embeddings).sample
+
+        noise_pred_uncond, noise_pred_pos = noise_pred.chunk(2)
+        noise_pred = noise_pred_uncond + guidance_scale * (noise_pred_pos - noise_pred_uncond)
+        w = (1 - self.alphas[t])
+        # w = self.alphas[t] ** 0.5 * (1 - self.alphas[t])
+
+        grad = grad_scale * w[:, None, None, None] * (noise_pred - noise)
+        grad = torch.nan_to_num(grad)
+        if grad_clamp:
+            grad = grad.clamp(-1, 1)
+
+        loss = SpecifyGradient.apply(latents, grad)
+        return loss
+
+
